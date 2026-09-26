@@ -28,11 +28,38 @@ See `example.py` for a complete inline schema and call to
 `sqlwitness.counterexample_multidialect(...)` return
 `(refuted, data, elapsed_seconds, iterations)`.
 
-Use `dialect="sqlite"`, `"mysql"`, or `"postgresql"` for a single backend;
-use `dialect_gt` and `dialect_cd` for cross-backend comparison. The API's default
-dialect is MySQL. Set `timeout` and `iteration` to bound the search. No counterexample
-within that budget **does not prove equivalence**. Boolean coverage runs locally;
-the separate `sqlwitness.online.coverage` client uses an external SQLFpc service.
+Parameters shared by both functions:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `schema` | Required | List of table definitions with `TableName`, `PKeys`, `FKeys`, and `Others`; see `example.py`. |
+| `constraints` | Required | Constraint text, a `.constraint`/`.yml` file path, or a parsed list. Pass `""`, `[]`, or `None` for no extra constraints. |
+| `groundtruth_query` | Required | Reference SQL query. |
+| `candidate_query` | Required | SQL query to compare against the reference. |
+| `timeout` | `4` | Search time budget in seconds, checked between iterations; not a database statement timeout. `None` or `0` disables it. |
+| `iteration` | `None` | Sequential iteration limit; `None` becomes one billion iterations, normally bounded by timeout or early stopping. Currently ignored in multiprocessing mode. |
+| `boolean_coverage` | `True` | Track Boolean predicate outcomes locally to guide generation and stopping. `False` disables this coverage tracking. |
+| `termination_method` | `"laplace"` | Coverage-based stopping estimator: `"laplace"` or `"good_turing"`. `None` disables the estimator, but other stopping conditions still apply. Used with Boolean coverage. |
+| `termination_target_risk` | `0.05` | Estimator threshold for finding new coverage, between 0 and 1; lower values generally search longer. This is not the probability that the queries are equivalent. |
+| `coverage` | `1` | Track outcomes for individual predicates (1-way); `2` tracks pairs, higher positive values track larger combinations, and `0` tracks full combinations. Used with Boolean coverage. |
+| `remove_null` | `False` | Keep NULL candidates enabled. `True` removes NULLs from ordinary value candidate pools; it is not a schema-wide NOT NULL constraint. |
+| `remove_one` | `False` | Keep both default non-NULL values per type. `True` removes the second default (e.g. numeric `1`); query-derived or constrained values may still include it. |
+| `remove_literal` | `False` | Keep query-literal value heuristics enabled. `True` disables those heuristics; explicit constraints still apply. |
+
+Parameters specific to each function:
+
+| Function | Parameter | Default | Meaning |
+| --- | --- | --- | --- |
+| `counterexample` | `dialect` | `"mysql"` | Backend for both queries: `"sqlite"`, `"mysql"`, or `"postgresql"`. |
+| `counterexample` | `use_multiprocessing` | `False` | Run sequentially; `True` starts eight independent worker processes. |
+| `counterexample` | `sqlfpc_coverage` | `False` | Legacy compatibility parameter; currently unused, so changing it has no effect. |
+| `counterexample_multidialect` | `dialect_gt` | `"mysql"` | Backend for the reference query. |
+| `counterexample_multidialect` | `dialect_cd` | `"postgresql"` | Backend for the candidate query. |
+
+Cross-backend search runs sequentially. The example overrides the API defaults
+with SQLite, a 10-second timeout, and 100 iterations. No counterexample within the
+search budget **does not prove equivalence**. The separate
+`sqlwitness.online.coverage` client can call the external SQLFpc service.
 
 ## MySQL and PostgreSQL
 
