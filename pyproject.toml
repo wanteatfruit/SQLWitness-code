@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sqlwitness"
+version = "0.1.0"
+description = "Find counterexample databases for SQL query equivalence"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "sqlglot==23.12.1",
+    "SQLAlchemy>=2.0,<2.1",
+    "pydantic>=2.5,<3",
+    "lark>=1.2,<2",
+    "python-dateutil>=2.8,<3",
+    "PyYAML>=6,<7",
+    "requests>=2.32,<3",
+]
+
+[project.optional-dependencies]
+mysql = ["PyMySQL[rsa]>=1.1,<2"]
+postgres = ["psycopg2-binary>=2.9,<3"]
+dev = ["pytest>=8,<9", "build>=1,<2"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sqlwitness*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
