@@ -12,14 +12,10 @@ from test_core import SCHEMA, GT, CD
 def test_search_defaults_and_removed_options(search):
     parameters = inspect.signature(search).parameters
     assert parameters['timeout'].default == 10
-    assert parameters['coverage'].default == 1
-    assert parameters['termination_method'].default == 'laplace'
-    assert 'sqlfpc_coverage' not in parameters
-    for coverage in (0, 2, 3):
-        with pytest.raises(ValueError, match='Only 1-way coverage'):
-            search(SCHEMA, '', GT, CD, coverage=coverage)
-    with pytest.raises(ValueError, match='termination_method'):
-        search(SCHEMA, '', GT, CD, termination_method='good_turing')
+    for removed in ('boolean_coverage', 'termination_method', 'coverage', 'sqlfpc_coverage'):
+        assert removed not in parameters
+        with pytest.raises(TypeError, match=removed):
+            search(SCHEMA, '', GT, CD, **{removed: None})
 
 
 def test_independent_predicates_and_aggregate_group_keys():
@@ -57,14 +53,27 @@ def test_laplace_patience_and_reset():
         create_terminator('good_turing')
 
 
-@pytest.mark.parametrize('method', ['laplace', None])
-@pytest.mark.parametrize('boolean_coverage', [True, False])
-def test_search_with_and_without_stopping(tmp_path, monkeypatch, method, boolean_coverage):
+def test_search_always_uses_coverage_and_laplace(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    # Equivalent but textually distinct queries must run the search.
     result = counterexample(
         SCHEMA, '', GT, 'SELECT id FROM employees WHERE 18 <= age', dialect='sqlite',
-        termination_method=method, boolean_coverage=boolean_coverage, iteration=2,
+        iteration=100, termination_target_risk=0.5,
     )
     assert result[0] is False
-    assert result[3] == 2
+    assert 0 < result[3] < 100
+    output = capsys.readouterr().out
+    assert 'Using laplace termination estimator' in output
+    assert 'Boolean coverage enabled (1-way)' in output
+    assert 'Statistical termination' in output
+
+
+def test_coverage_failure_keeps_bounded_fallback(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('sqlwitness.build_boolean_coverage', lambda *args, **kwargs: None)
+    result = counterexample(
+        SCHEMA, '', GT, 'SELECT id FROM employees WHERE 18 <= age',
+        dialect='sqlite', iteration=100,
+    )
+    assert result[0] is False
+    assert result[3] == 20
+    assert not list(tmp_path.glob('*.db'))

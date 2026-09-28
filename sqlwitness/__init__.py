@@ -463,7 +463,6 @@ def _worker_loop(
     num_cd_agg_predicates: int,
     num_gt_predicates: int,
     num_cd_predicates: int,
-    termination_method: Optional[str],
     termination_target_risk: float,
     coverage_available: bool,
     fallback_max_iters: int = 0,
@@ -486,9 +485,8 @@ def _worker_loop(
     cardinality_boost: int = 1
 
     terminator = None
-    if termination_method and coverage_available:
+    if coverage_available:
         terminator = create_terminator(
-            method=termination_method,
             target_risk=termination_target_risk,
         )
 
@@ -607,19 +605,11 @@ def counterexample(
     iteration: Optional[int] = None,
     dialect: str = 'mysql',
     use_multiprocessing: bool = False,
-    boolean_coverage: bool = True,
-    termination_method: Optional[str] = 'laplace',
     termination_target_risk: float = 0.05,
-    coverage: int = 1,
     remove_null: bool = False,
     remove_one: bool = False,
     remove_literal: bool = False,
 ) -> Tuple[bool, Optional[Dict[str, List[Any]]], float, int]:
-
-    if coverage != 1:
-        raise ValueError("Only 1-way coverage is supported; use coverage=1.")
-    if termination_method not in (None, 'laplace'):
-        raise ValueError("termination_method must be 'laplace' or None.")
 
     if groundtruth_query.strip() == candidate_query.strip():
         return False, None, 0.0, 0
@@ -677,14 +667,11 @@ def counterexample(
     cardinality_boost: int = 1
     cardinality_boost_previous: int = 1
     
-    # Statistical termination estimator (optional)
-    terminator = None
-    if termination_method and boolean_coverage:
-        terminator = create_terminator(
-            method=termination_method,
-            target_risk=termination_target_risk,
-        )
-        print(f"Using {termination_method} termination estimator (target_risk={termination_target_risk})")
+    # Laplace termination estimator
+    terminator = create_terminator(target_risk=termination_target_risk)
+    print(f"Using laplace termination estimator (target_risk={termination_target_risk})")
+
+    coverage_enabled = True
 
     # Coverage query variables
     gt_row_coverage_query: Optional[str] = None
@@ -698,57 +685,56 @@ def counterexample(
     cov_accum: Optional[CoverageAccumulator] = None
 
     fallback_max_iters: int = 0
-    if boolean_coverage:
-        gt_coverage_result = build_boolean_coverage(groundtruth_query, dialect=dialect)
-        cd_coverage_result = build_boolean_coverage(candidate_query, dialect=dialect)
+    gt_coverage_result = build_boolean_coverage(groundtruth_query, dialect=dialect)
+    cd_coverage_result = build_boolean_coverage(candidate_query, dialect=dialect)
 
-        gt_failed = gt_coverage_result is None
-        cd_failed = cd_coverage_result is None
-        if gt_failed:
-            print(f"⚠️  PARSE ERROR: Boolean coverage construction failed for ground truth query")
-            print(f"   Query: {groundtruth_query[:200]}...")
-        if cd_failed:
-            print(f"⚠️  PARSE ERROR: Boolean coverage construction failed for candidate query")
-            print(f"   Query: {candidate_query[:200]}...")
+    gt_failed = gt_coverage_result is None
+    cd_failed = cd_coverage_result is None
+    if gt_failed:
+        print(f"⚠️  PARSE ERROR: Boolean coverage construction failed for ground truth query")
+        print(f"   Query: {groundtruth_query[:200]}...")
+    if cd_failed:
+        print(f"⚠️  PARSE ERROR: Boolean coverage construction failed for candidate query")
+        print(f"   Query: {candidate_query[:200]}...")
 
-        if gt_failed and cd_failed:
-            print(f"   Both coverage queries failed – falling back to 20-iteration hard limit.")
-            boolean_coverage = False
-            fallback_max_iters = 20
-        else:
-            if gt_failed or cd_failed:
-                print(f"   Partial coverage parse failure – continuing with available signal.")
-            if gt_coverage_result is not None:
-                gt_row_coverage_query = gt_coverage_result.get('row_coverage')
-                gt_agg_coverage_query = gt_coverage_result.get('agg_coverage')
-                gt_pred_counts = count_predicates(gt_coverage_result)
-                num_gt_row_predicates = gt_pred_counts['row_predicates']
-                num_gt_agg_predicates = gt_pred_counts['agg_predicates']
-                num_gt_predicates = num_gt_row_predicates + num_gt_agg_predicates
-            if cd_coverage_result is not None:
-                cd_row_coverage_query = cd_coverage_result.get('row_coverage')
-                cd_agg_coverage_query = cd_coverage_result.get('agg_coverage')
-                cd_pred_counts = count_predicates(cd_coverage_result)
-                num_cd_row_predicates = cd_pred_counts['row_predicates']
-                num_cd_agg_predicates = cd_pred_counts['agg_predicates']
-                num_cd_predicates = num_cd_row_predicates + num_cd_agg_predicates
+    if gt_failed and cd_failed:
+        print(f"   Both coverage queries failed – falling back to 20-iteration hard limit.")
+        coverage_enabled = False
+        fallback_max_iters = 20
+    else:
+        if gt_failed or cd_failed:
+            print(f"   Partial coverage parse failure – continuing with available signal.")
+        if gt_coverage_result is not None:
+            gt_row_coverage_query = gt_coverage_result.get('row_coverage')
+            gt_agg_coverage_query = gt_coverage_result.get('agg_coverage')
+            gt_pred_counts = count_predicates(gt_coverage_result)
+            num_gt_row_predicates = gt_pred_counts['row_predicates']
+            num_gt_agg_predicates = gt_pred_counts['agg_predicates']
+            num_gt_predicates = num_gt_row_predicates + num_gt_agg_predicates
+        if cd_coverage_result is not None:
+            cd_row_coverage_query = cd_coverage_result.get('row_coverage')
+            cd_agg_coverage_query = cd_coverage_result.get('agg_coverage')
+            cd_pred_counts = count_predicates(cd_coverage_result)
+            num_cd_row_predicates = cd_pred_counts['row_predicates']
+            num_cd_agg_predicates = cd_pred_counts['agg_predicates']
+            num_cd_predicates = num_cd_row_predicates + num_cd_agg_predicates
 
-            cov_accum = CoverageAccumulator(
-                num_gt_row_predicates, num_gt_agg_predicates,
-                num_cd_row_predicates, num_cd_agg_predicates,
-            )
+        cov_accum = CoverageAccumulator(
+            num_gt_row_predicates, num_gt_agg_predicates,
+            num_cd_row_predicates, num_cd_agg_predicates,
+        )
 
-            cov_label = "1-way"
-            print(f"Boolean coverage enabled ({cov_label}):")
-            print(f"  GT: {num_gt_row_predicates} row predicates + {num_gt_agg_predicates} agg predicates = {num_gt_predicates} total")
-            print(f"  CD: {num_cd_row_predicates} row predicates + {num_cd_agg_predicates} agg predicates = {num_cd_predicates} total")
+        cov_label = "1-way"
+        print(f"Boolean coverage enabled ({cov_label}):")
+        print(f"  GT: {num_gt_row_predicates} row predicates + {num_gt_agg_predicates} agg predicates = {num_gt_predicates} total")
+        print(f"  CD: {num_cd_row_predicates} row predicates + {num_cd_agg_predicates} agg predicates = {num_cd_predicates} total")
     coverage_available = any([
         gt_row_coverage_query,
         gt_agg_coverage_query,
         cd_row_coverage_query,
         cd_agg_coverage_query
     ])
-    if boolean_coverage and not coverage_available:
+    if coverage_enabled and not coverage_available:
         print("⚠️  Boolean coverage enabled, but no coverage queries were generated (no predicates).")
         print(f"   Terminator will receive no-improvement signals each iteration.")
     start_time = time.time()
@@ -773,17 +759,16 @@ def counterexample(
             constraints_parsed=constraints_parsed,
             groundtruth_query=groundtruth_query,
             candidate_query=candidate_query,
-            gt_row_coverage_query=gt_row_coverage_query if boolean_coverage else None,
-            cd_row_coverage_query=cd_row_coverage_query if boolean_coverage else None,
-            gt_agg_coverage_query=gt_agg_coverage_query if boolean_coverage else None,
-            cd_agg_coverage_query=cd_agg_coverage_query if boolean_coverage else None,
+            gt_row_coverage_query=gt_row_coverage_query if coverage_enabled else None,
+            cd_row_coverage_query=cd_row_coverage_query if coverage_enabled else None,
+            gt_agg_coverage_query=gt_agg_coverage_query if coverage_enabled else None,
+            cd_agg_coverage_query=cd_agg_coverage_query if coverage_enabled else None,
             num_gt_row_predicates=num_gt_row_predicates,
             num_cd_row_predicates=num_cd_row_predicates,
             num_gt_agg_predicates=num_gt_agg_predicates,
             num_cd_agg_predicates=num_cd_agg_predicates,
             num_gt_predicates=num_gt_predicates,
             num_cd_predicates=num_cd_predicates,
-            termination_method=termination_method,
             termination_target_risk=termination_target_risk,
             coverage_available=coverage_available,
             fallback_max_iters=fallback_max_iters,
@@ -925,10 +910,10 @@ def counterexample(
                     constraints_parsed=constraints_parsed,
                     groundtruth_query=groundtruth_query,
                     candidate_query=candidate_query,
-                    boolean_gt_row_coverage_query=gt_row_coverage_query if boolean_coverage else None,
-                    boolean_cd_row_coverage_query=cd_row_coverage_query if boolean_coverage else None,
-                    boolean_gt_agg_coverage_query=gt_agg_coverage_query if boolean_coverage else None,
-                    boolean_cd_agg_coverage_query=cd_agg_coverage_query if boolean_coverage else None,
+                    boolean_gt_row_coverage_query=gt_row_coverage_query if coverage_enabled else None,
+                    boolean_cd_row_coverage_query=cd_row_coverage_query if coverage_enabled else None,
+                    boolean_gt_agg_coverage_query=gt_agg_coverage_query if coverage_enabled else None,
+                    boolean_cd_agg_coverage_query=cd_agg_coverage_query if coverage_enabled else None,
                     num_gt_row_predicates=num_gt_row_predicates,
                     num_cd_row_predicates=num_cd_row_predicates,
                     cardinality_boost=cardinality_boost,
@@ -953,7 +938,7 @@ def counterexample(
                         current_gt_signal = current_cd_signal = 0
 
                     # Check for early termination
-                    if boolean_coverage and coverage_available:
+                    if coverage_enabled and coverage_available:
                         if coverage_improved:
                             iterations_without_improvement = 0
                             previous_gt_total_outcomes = current_gt_signal
@@ -986,7 +971,7 @@ def counterexample(
 
                 # When coverage is saturated, skip_coverage=True causes status="not_found"
                 # instead of "not_found_with_coverage". Still feed no-improvement to terminator.
-                if coverage_saturated and status == "not_found" and boolean_coverage and coverage_available:
+                if coverage_saturated and status == "not_found" and coverage_enabled and coverage_available:
                     iterations_without_improvement += 1
                     cardinality_boost += 2
                     if terminator is not None:
@@ -1000,7 +985,7 @@ def counterexample(
                             total_time = time.time() - start_time
                             return False, None, total_time, seq_iters
 
-                if boolean_coverage and not coverage_available and terminator is not None:
+                if coverage_enabled and not coverage_available and terminator is not None:
                     terminator.update(False)
                     if terminator.should_terminate():
                         stats = terminator.get_stats()
@@ -1047,7 +1032,7 @@ def counterexample(
     total_time = time.time() - start_time
     print(f"Search finished after {iteration} iterations. No counterexample found.")
 
-    if boolean_coverage and cov_accum is not None:
+    if coverage_enabled and cov_accum is not None:
         print("\n================== Final Boolean Coverage Summary =================")
         cov_accum.print_final_summary()
         print("===================================================================")
@@ -1064,19 +1049,11 @@ def counterexample_multidialect(
     iteration: Optional[int] = None,
     dialect_gt: str = 'mysql',
     dialect_cd: str = 'postgresql',
-    boolean_coverage: bool = True,
-    termination_method: Optional[str] = 'laplace',
     termination_target_risk: float = 0.05,
-    coverage: int = 1,
     remove_null: bool = False,
     remove_one: bool = False,
     remove_literal: bool = False,
 ) -> Tuple[bool, Optional[Dict[str, List[Any]]], float, int]:
-
-    if coverage != 1:
-        raise ValueError("Only 1-way coverage is supported; use coverage=1.")
-    if termination_method not in (None, 'laplace'):
-        raise ValueError("termination_method must be 'laplace' or None.")
 
     if groundtruth_query.strip() == candidate_query.strip():
         return False, None, 0.0, 0
@@ -1137,13 +1114,10 @@ def counterexample_multidialect(
     cardinality_boost: int = 1
 
     # Statistical termination estimator
-    terminator = None
-    if termination_method and boolean_coverage:
-        terminator = create_terminator(
-            method=termination_method,
-            target_risk=termination_target_risk,
-        )
-        print(f"Using {termination_method} termination estimator (target_risk={termination_target_risk})")
+    terminator = create_terminator(target_risk=termination_target_risk)
+    print(f"Using laplace termination estimator (target_risk={termination_target_risk})")
+
+    coverage_enabled = True
 
     # Coverage query variables
     gt_row_coverage_query: Optional[str] = None
@@ -1156,50 +1130,49 @@ def counterexample_multidialect(
     num_cd_agg_predicates: int = 0
     cov_accum: Optional[CoverageAccumulator] = None
 
-    if boolean_coverage:
-        gt_coverage_result = build_boolean_coverage(groundtruth_query, dialect=dialect_gt)
-        cd_coverage_result = build_boolean_coverage(candidate_query, dialect=dialect_cd)
+    gt_coverage_result = build_boolean_coverage(groundtruth_query, dialect=dialect_gt)
+    cd_coverage_result = build_boolean_coverage(candidate_query, dialect=dialect_cd)
 
-        coverage_disabled = False
-        if gt_coverage_result is None:
-            print(f"⚠️  PARSE ERROR: Boolean coverage construction failed for ground truth query")
-            print(f"   Query: {groundtruth_query[:200]}...")
-            coverage_disabled = True
-        if cd_coverage_result is None:
-            print(f"⚠️  PARSE ERROR: Boolean coverage construction failed for candidate query")
-            print(f"   Query: {candidate_query[:200]}...")
-            coverage_disabled = True
+    coverage_disabled = False
+    if gt_coverage_result is None:
+        print(f"⚠️  PARSE ERROR: Boolean coverage construction failed for ground truth query")
+        print(f"   Query: {groundtruth_query[:200]}...")
+        coverage_disabled = True
+    if cd_coverage_result is None:
+        print(f"⚠️  PARSE ERROR: Boolean coverage construction failed for candidate query")
+        print(f"   Query: {candidate_query[:200]}...")
+        coverage_disabled = True
 
-        if coverage_disabled:
-            print(f"   Skipping boolean coverage for this query pair (parse error only)")
-            boolean_coverage = False
-        else:
-            assert gt_coverage_result is not None
-            assert cd_coverage_result is not None
-            gt_row_coverage_query = gt_coverage_result.get('row_coverage')
-            gt_agg_coverage_query = gt_coverage_result.get('agg_coverage')
-            cd_row_coverage_query = cd_coverage_result.get('row_coverage')
-            cd_agg_coverage_query = cd_coverage_result.get('agg_coverage')
+    if coverage_disabled:
+        print(f"   Skipping boolean coverage for this query pair (parse error only)")
+        coverage_enabled = False
+    else:
+        assert gt_coverage_result is not None
+        assert cd_coverage_result is not None
+        gt_row_coverage_query = gt_coverage_result.get('row_coverage')
+        gt_agg_coverage_query = gt_coverage_result.get('agg_coverage')
+        cd_row_coverage_query = cd_coverage_result.get('row_coverage')
+        cd_agg_coverage_query = cd_coverage_result.get('agg_coverage')
 
-            gt_pred_counts = count_predicates(gt_coverage_result)
-            num_gt_row_predicates = gt_pred_counts['row_predicates']
-            num_gt_agg_predicates = gt_pred_counts['agg_predicates']
-            num_gt_predicates = num_gt_row_predicates + num_gt_agg_predicates
+        gt_pred_counts = count_predicates(gt_coverage_result)
+        num_gt_row_predicates = gt_pred_counts['row_predicates']
+        num_gt_agg_predicates = gt_pred_counts['agg_predicates']
+        num_gt_predicates = num_gt_row_predicates + num_gt_agg_predicates
 
-            cd_pred_counts = count_predicates(cd_coverage_result)
-            num_cd_row_predicates = cd_pred_counts['row_predicates']
-            num_cd_agg_predicates = cd_pred_counts['agg_predicates']
-            num_cd_predicates = num_cd_row_predicates + num_cd_agg_predicates
+        cd_pred_counts = count_predicates(cd_coverage_result)
+        num_cd_row_predicates = cd_pred_counts['row_predicates']
+        num_cd_agg_predicates = cd_pred_counts['agg_predicates']
+        num_cd_predicates = num_cd_row_predicates + num_cd_agg_predicates
 
-            cov_accum = CoverageAccumulator(
-                num_gt_row_predicates, num_gt_agg_predicates,
-                num_cd_row_predicates, num_cd_agg_predicates,
-            )
+        cov_accum = CoverageAccumulator(
+            num_gt_row_predicates, num_gt_agg_predicates,
+            num_cd_row_predicates, num_cd_agg_predicates,
+        )
 
-            cov_label = "1-way"
-            print(f"Boolean coverage enabled ({cov_label}):")
-            print(f"  GT: {num_gt_row_predicates} row predicates + {num_gt_agg_predicates} agg predicates = {num_gt_predicates} total")
-            print(f"  CD: {num_cd_row_predicates} row predicates + {num_cd_agg_predicates} agg predicates = {num_cd_predicates} total")
+        cov_label = "1-way"
+        print(f"Boolean coverage enabled ({cov_label}):")
+        print(f"  GT: {num_gt_row_predicates} row predicates + {num_gt_agg_predicates} agg predicates = {num_gt_predicates} total")
+        print(f"  CD: {num_cd_row_predicates} row predicates + {num_cd_agg_predicates} agg predicates = {num_cd_predicates} total")
 
     coverage_available = any([
         gt_row_coverage_query,
@@ -1207,7 +1180,7 @@ def counterexample_multidialect(
         cd_row_coverage_query,
         cd_agg_coverage_query,
     ])
-    if boolean_coverage and not coverage_available:
+    if coverage_enabled and not coverage_available:
         print("⚠️  Boolean coverage enabled, but no coverage queries were generated (no predicates).")
         print(f"   Terminator will receive no-improvement signals each iteration.")
 
@@ -1292,8 +1265,8 @@ def counterexample_multidialect(
             else:
                 coverage_results_gt = collect_coverage_outcomes(
                     runner=persistent_runner_gt,
-                    gt_row_query=gt_row_coverage_query if boolean_coverage else None,
-                    gt_agg_query=gt_agg_coverage_query if boolean_coverage else None,
+                    gt_row_query=gt_row_coverage_query if coverage_enabled else None,
+                    gt_agg_query=gt_agg_coverage_query if coverage_enabled else None,
                     cd_row_query=None,
                     cd_agg_query=None,
                     num_gt_row_predicates=num_gt_row_predicates,
@@ -1304,8 +1277,8 @@ def counterexample_multidialect(
                     runner=persistent_runner_cd,
                     gt_row_query=None,
                     gt_agg_query=None,
-                    cd_row_query=cd_row_coverage_query if boolean_coverage else None,
-                    cd_agg_query=cd_agg_coverage_query if boolean_coverage else None,
+                    cd_row_query=cd_row_coverage_query if coverage_enabled else None,
+                    cd_agg_query=cd_agg_coverage_query if coverage_enabled else None,
                     num_gt_row_predicates=0,
                     num_cd_row_predicates=num_cd_row_predicates,
                     worker_label=str(i),
@@ -1357,7 +1330,7 @@ def counterexample_multidialect(
                     coverage_improved = False
                     current_gt_signal = current_cd_signal = 0
 
-                if boolean_coverage and coverage_available:
+                if coverage_enabled and coverage_available:
                     if coverage_improved:
                         iterations_without_improvement = 0
                         previous_gt_total_outcomes = current_gt_signal
@@ -1390,7 +1363,7 @@ def counterexample_multidialect(
 
             # When coverage is saturated, skip_coverage=True causes status="not_found".
             # Still feed no-improvement to terminator.
-            if coverage_saturated and status == "not_found" and boolean_coverage and coverage_available:
+            if coverage_saturated and status == "not_found" and coverage_enabled and coverage_available:
                 iterations_without_improvement += 1
                 cardinality_boost += 2
                 if terminator is not None:
@@ -1404,7 +1377,7 @@ def counterexample_multidialect(
                         total_time = time.time() - start_time
                         return False, None, total_time, seq_iters
 
-            if boolean_coverage and not coverage_available and terminator is not None:
+            if coverage_enabled and not coverage_available and terminator is not None:
                 terminator.update(False)
                 if terminator.should_terminate():
                     stats = terminator.get_stats()
@@ -1461,7 +1434,7 @@ def counterexample_multidialect(
     total_time = time.time() - start_time
     print(f"Search finished after {iteration} iterations. No counterexample found.")
 
-    if boolean_coverage and cov_accum is not None:
+    if coverage_enabled and cov_accum is not None:
         print("\n================== Final Boolean Coverage Summary =================")
         cov_accum.print_final_summary()
         print("===================================================================")
