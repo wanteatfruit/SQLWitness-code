@@ -27,7 +27,6 @@ def main():
         groundtruth_query=GROUNDTRUTH,
         candidate_query=CANDIDATE,
         dialect=args.dialect,
-        timeout=10,
         iteration=100,
         use_multiprocessing=False,
     )

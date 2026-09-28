@@ -1,15 +1,5 @@
-"""
-Coverage query generation for Grey-Box SQL Fuzzing.
+"""Boolean coverage queries and cumulative 1-way predicate outcome tracking."""
 
-Generates Row-Level and Aggregate-Level coverage queries that use 3-valued logic
-to distinguish TRUE, FALSE, and NULL predicate outcomes.
-
-Also provides CoverageAccumulator, a self-contained object that tracks cumulative
-t-way predicate coverage across fuzzing iterations.  Swap the t-way degree (TWAY_T)
-or subclass CoverageAccumulator to experiment with different combinatorial strategies.
-"""
-
-from itertools import combinations as _comb
 from typing import Dict, List, Optional, Tuple
 from sqlglot import parse_one, exp
 
@@ -374,294 +364,61 @@ def count_predicates(coverage_result: Optional[Dict[str, Optional[str]]]) -> Dic
 # T-way interaction coverage utilities
 # ---------------------------------------------------------------------------
 
-TWAY_T: int = 1  # t-way interaction coverage degree (1 = per-predicate)
-
-
-def _make_tway_dict(n: int, t: int) -> Dict[Tuple, set]:
-    """Initialize a t-way coverage dict: {(i, j, …): set_of_observed_value_tuples}.
-    Returns {} when n < t (falls back gracefully to per-predicate signal).
-    """
-    if n < t:
-        return {}
-    return {idx_tuple: set() for idx_tuple in _comb(range(n), t)}
-
-
-def _update_tway(flat_row: List, tway_dict: Dict[Tuple, set]) -> None:
-    """Record one flat outcome row in the t-way coverage dict."""
-    for idx_tuple, seen in tway_dict.items():
-        seen.add(tuple(flat_row[i] for i in idx_tuple))
-
-
-def _tway_total(tway_dict: Dict[Tuple, set]) -> int:
-    """Return the total number of distinct t-tuples observed so far."""
-    return sum(len(s) for s in tway_dict.values())
-
-
-# ---------------------------------------------------------------------------
-# CoverageAccumulator – pluggable coverage-state object
-# ---------------------------------------------------------------------------
-
 class CoverageAccumulator:
-    """
-    Tracks cumulative t-way predicate coverage across fuzzing iterations.
+    """Track each predicate's outcomes independently across iterations.
 
-    Encapsulates all mutable coverage state (per-predicate sets, pairwise dicts)
-    so that different combinatorial strategies can be swapped in for study by
-    either changing TWAY_T or subclassing.
-
-    Outcomes are tagged tuples supplied by collect_coverage_outcomes():
-        gt_outcomes / cd_outcomes: List[('row'|'agg', row_tuple)]
-
-    Row outcomes carry Sig_Where / Sig_Join / Sig_Case values in column order.
-    Agg outcomes carry GROUP-BY keys first, then Sig_Having values at the end.
+    Row outcomes contain predicate signals in order. Aggregate outcomes have
+    GROUP BY keys followed by HAVING predicate signals.
     """
 
-    def __init__(
-        self,
-        num_gt_row_predicates: int,
-        num_gt_agg_predicates: int,
-        num_cd_row_predicates: int,
-        num_cd_agg_predicates: int,
-        tway_t: int = TWAY_T,
-    ) -> None:
+    def __init__(self, num_gt_row_predicates: int, num_gt_agg_predicates: int,
+                 num_cd_row_predicates: int, num_cd_agg_predicates: int) -> None:
         self.num_gt_row = num_gt_row_predicates
         self.num_gt_agg = num_gt_agg_predicates
         self.num_cd_row = num_cd_row_predicates
         self.num_cd_agg = num_cd_agg_predicates
         self.num_gt = num_gt_row_predicates + num_gt_agg_predicates
         self.num_cd = num_cd_row_predicates + num_cd_agg_predicates
-        self.tway_t = tway_t
-
-        # t=0: full-combination mode — track each unique complete outcome tuple.
-        # Max distinct tuples per scope = 3^n  (one slot per predicate in that scope).
-        self.use_full: bool = tway_t == 0
-        self.use_tway: bool = False  # set below for t >= 2
-
-        if self.use_full:
-            self.full_gt_row: set = set()
-            self.full_gt_agg: set = set()
-            self.full_cd_row: set = set()
-            self.full_cd_agg: set = set()
-            # per-predicate and pairwise structures unused in this mode
-            self.cumulative_gt: List[set] = []
-            self.cumulative_cd: List[set] = []
-            self.pairwise_gt_row: Dict[Tuple, set] = {}
-            self.pairwise_gt_agg: Dict[Tuple, set] = {}
-            self.pairwise_cd_row: Dict[Tuple, set] = {}
-            self.pairwise_cd_agg: Dict[Tuple, set] = {}
-        else:
-            self.cumulative_gt = [set() for _ in range(self.num_gt)]
-            self.cumulative_cd = [set() for _ in range(self.num_cd)]
-            self.pairwise_gt_row = _make_tway_dict(num_gt_row_predicates, tway_t)
-            self.pairwise_gt_agg = _make_tway_dict(num_gt_agg_predicates, tway_t)
-            self.pairwise_cd_row = _make_tway_dict(num_cd_row_predicates, tway_t)
-            self.pairwise_cd_agg = _make_tway_dict(num_cd_agg_predicates, tway_t)
-            self.use_tway = tway_t > 1 and bool(
-                self.pairwise_gt_row or self.pairwise_gt_agg
-                or self.pairwise_cd_row or self.pairwise_cd_agg
-            )
-
-    # ------------------------------------------------------------------
-    # Internal signal helpers
-    # ------------------------------------------------------------------
-
-    def _current_gt_signal(self) -> int:
-        if self.use_full:
-            return len(self.full_gt_row) + len(self.full_gt_agg)
-        if self.use_tway:
-            return _tway_total(self.pairwise_gt_row) + _tway_total(self.pairwise_gt_agg)
-        return sum(len(s) for s in self.cumulative_gt)
-
-    def _current_cd_signal(self) -> int:
-        if self.use_full:
-            return len(self.full_cd_row) + len(self.full_cd_agg)
-        if self.use_tway:
-            return _tway_total(self.pairwise_cd_row) + _tway_total(self.pairwise_cd_agg)
-        return sum(len(s) for s in self.cumulative_cd)
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self.cumulative_gt = [set() for _ in range(self.num_gt)]
+        self.cumulative_cd = [set() for _ in range(self.num_cd)]
 
     def compute_signal(self) -> Tuple[int, int]:
-        """Return (gt_signal, cd_signal) according to the current t-way strategy."""
-        return self._current_gt_signal(), self._current_cd_signal()
+        """Return total distinct per-predicate outcomes for each query."""
+        return (sum(map(len, self.cumulative_gt)), sum(map(len, self.cumulative_cd)))
 
     def is_saturated(self) -> bool:
-        """Return True if all predicates have observed all 3 outcomes (-1, 0, 1).
-
-        When saturated, running additional coverage queries yields no new
-        signal and can be skipped to save execution time.
-        """
-        if self.use_full or self.use_tway:
-            # Full-combination and t-way modes don't have a simple saturation
-            # bound, so never short-circuit them.
-            return False
-        for s in self.cumulative_gt:
-            if len(s) < 3:
-                return False
-        for s in self.cumulative_cd:
-            if len(s) < 3:
-                return False
-        # All per-predicate sets have all 3 values
-        return (self.num_gt + self.num_cd) > 0
+        predicates = self.cumulative_gt + self.cumulative_cd
+        return bool(predicates) and all(len(outcomes) == 3 for outcomes in predicates)
 
     def update(self, coverage_results: Dict) -> bool:
-        """
-        Ingest one iteration's coverage_results dict.
-        Returns True if any new signal was observed (coverage improved).
-        """
-        prev_gt = self._current_gt_signal()
-        prev_cd = self._current_cd_signal()
-
-        gt_outcomes: List = coverage_results.get('gt_outcomes', [])
-        if gt_outcomes and self.num_gt > 0:
-            for outcome_type, row in gt_outcomes:
-                if outcome_type == 'row' and self.num_gt_row > 0:
-                    flat = [row[idx] for idx in range(min(len(row), self.num_gt_row))]
-                    if self.use_full:
-                        self.full_gt_row.add(tuple(flat))
-                    else:
-                        for pred_idx, val in enumerate(flat):
-                            self.cumulative_gt[pred_idx].add(val)
-                        if self.pairwise_gt_row and self.tway_t > 1:
-                            _update_tway(flat, self.pairwise_gt_row)
-                elif outcome_type == 'agg' and self.num_gt_agg > 0:
-                    num_group_keys = len(row) - self.num_gt_agg
-                    flat = []
-                    for sig_idx in range(self.num_gt_agg):
-                        col_idx = num_group_keys + sig_idx
-                        if col_idx < len(row):
-                            flat.append(row[col_idx])
-                            if not self.use_full:
-                                pred_idx = self.num_gt_row + sig_idx
-                                if pred_idx < len(self.cumulative_gt):
-                                    self.cumulative_gt[pred_idx].add(row[col_idx])
-                    if self.use_full:
-                        if flat:
-                            self.full_gt_agg.add(tuple(flat))
-                    elif self.pairwise_gt_agg and flat and self.tway_t > 1:
-                        _update_tway(flat, self.pairwise_gt_agg)
-
-        cd_outcomes: List = coverage_results.get('cd_outcomes', [])
-        if cd_outcomes and self.num_cd > 0:
-            for outcome_type, row in cd_outcomes:
-                if outcome_type == 'row' and self.num_cd_row > 0:
-                    flat = [row[idx] for idx in range(min(len(row), self.num_cd_row))]
-                    if self.use_full:
-                        self.full_cd_row.add(tuple(flat))
-                    else:
-                        for pred_idx, val in enumerate(flat):
-                            self.cumulative_cd[pred_idx].add(val)
-                        if self.pairwise_cd_row and self.tway_t > 1:
-                            _update_tway(flat, self.pairwise_cd_row)
-                elif outcome_type == 'agg' and self.num_cd_agg > 0:
-                    num_group_keys = len(row) - self.num_cd_agg
-                    flat = []
-                    for sig_idx in range(self.num_cd_agg):
-                        col_idx = num_group_keys + sig_idx
-                        if col_idx < len(row):
-                            flat.append(row[col_idx])
-                            if not self.use_full:
-                                pred_idx = self.num_cd_row + sig_idx
-                                if pred_idx < len(self.cumulative_cd):
-                                    self.cumulative_cd[pred_idx].add(row[col_idx])
-                    if self.use_full:
-                        if flat:
-                            self.full_cd_agg.add(tuple(flat))
-                    elif self.pairwise_cd_agg and flat and self.tway_t > 1:
-                        _update_tway(flat, self.pairwise_cd_agg)
-
-        return self._current_gt_signal() > prev_gt or self._current_cd_signal() > prev_cd
+        previous = self.compute_signal()
+        for key, row_count, agg_count, cumulative in (
+            ('gt_outcomes', self.num_gt_row, self.num_gt_agg, self.cumulative_gt),
+            ('cd_outcomes', self.num_cd_row, self.num_cd_agg, self.cumulative_cd),
+        ):
+            for kind, row in coverage_results.get(key, []):
+                if kind == 'row':
+                    for index, value in enumerate(row[:row_count]):
+                        cumulative[index].add(value)
+                elif kind == 'agg' and agg_count:
+                    for index, value in enumerate(row[-agg_count:]):
+                        cumulative[row_count + index].add(value)
+        return self.compute_signal() != previous
 
     def print_iter_summary(self, i: int) -> None:
-        """Print per-iteration coverage progress."""
-        gt_signal, cd_signal = self.compute_signal()
-        if self.num_gt > 0:
-            if self.use_full:
-                gt_row_max = (3 ** self.num_gt_row) if self.num_gt_row > 0 else 0
-                gt_agg_max = (3 ** self.num_gt_agg) if self.num_gt_agg > 0 else 0
-                print(f"Iteration {i}: GT Full-Combination Coverage: "
-                      f"{len(self.full_gt_row)}/{gt_row_max} row-combos, "
-                      f"{len(self.full_gt_agg)}/{gt_agg_max} agg-combos")
-            elif self.use_tway:
-                gt_pred_cov = [len(s) for s in self.cumulative_gt]
-                gt_total = sum(gt_pred_cov)
-                gt_max = self.num_gt * 3
-                pw_max = (len(self.pairwise_gt_row) + len(self.pairwise_gt_agg)) * (3 ** self.tway_t)
-                rate = gt_signal / pw_max if pw_max > 0 else 0
-                print(f"Iteration {i}: GT {self.tway_t}-way Coverage: {gt_signal}/{pw_max} pairs ({rate:.2%}) | per-pred: {gt_total}/{gt_max} {gt_pred_cov}")
-            else:
-                gt_pred_cov = [len(s) for s in self.cumulative_gt]
-                gt_total = sum(gt_pred_cov)
-                gt_max = self.num_gt * 3
-                rate = gt_total / gt_max if gt_max > 0 else 0
-                print(f"Iteration {i}: GT Boolean Coverage: {gt_total}/{gt_max} outcomes ({rate:.2%})")
-                print(f"  Per-predicate coverage: {gt_pred_cov}")
-        if self.num_cd > 0:
-            if self.use_full:
-                cd_row_max = (3 ** self.num_cd_row) if self.num_cd_row > 0 else 0
-                cd_agg_max = (3 ** self.num_cd_agg) if self.num_cd_agg > 0 else 0
-                print(f"Iteration {i}: CD Full-Combination Coverage: "
-                      f"{len(self.full_cd_row)}/{cd_row_max} row-combos, "
-                      f"{len(self.full_cd_agg)}/{cd_agg_max} agg-combos")
-            elif self.use_tway:
-                cd_pred_cov = [len(s) for s in self.cumulative_cd]
-                cd_total = sum(cd_pred_cov)
-                cd_max = self.num_cd * 3
-                pw_max = (len(self.pairwise_cd_row) + len(self.pairwise_cd_agg)) * (3 ** self.tway_t)
-                rate = cd_signal / pw_max if pw_max > 0 else 0
-                print(f"Iteration {i}: CD {self.tway_t}-way Coverage: {cd_signal}/{pw_max} pairs ({rate:.2%}) | per-pred: {cd_total}/{cd_max} {cd_pred_cov}")
-            else:
-                cd_pred_cov = [len(s) for s in self.cumulative_cd]
-                cd_total = sum(cd_pred_cov)
-                cd_max = self.num_cd * 3
-                rate = cd_total / cd_max if cd_max > 0 else 0
-                print(f"Iteration {i}: CD Boolean Coverage: {cd_total}/{cd_max} outcomes ({rate:.2%})")
-                print(f"  Per-predicate coverage: {cd_pred_cov}")
+        for label, cumulative in (('GT', self.cumulative_gt), ('CD', self.cumulative_cd)):
+            if cumulative:
+                counts = [len(outcomes) for outcomes in cumulative]
+                total, maximum = sum(counts), len(counts) * 3
+                print(f"Iteration {i}: {label} 1-way Coverage: {total}/{maximum} outcomes ({total / maximum:.2%})")
+                print(f"  Per-predicate coverage: {counts}")
 
     def print_final_summary(self) -> None:
-        """Print end-of-run coverage summary."""
-        gt_signal, cd_signal = self.compute_signal()
-        if self.num_gt > 0:
-            if self.use_full:
-                gt_row_max = (3 ** self.num_gt_row) if self.num_gt_row > 0 else 0
-                gt_agg_max = (3 ** self.num_gt_agg) if self.num_gt_agg > 0 else 0
-                print(f"GT Full-Combination Coverage: {len(self.full_gt_row)}/{gt_row_max} row-combos, {len(self.full_gt_agg)}/{gt_agg_max} agg-combos")
-            else:
-                gt_pred_cov = [len(s) for s in self.cumulative_gt]
-                gt_total = sum(gt_pred_cov)
-                gt_max = self.num_gt * 3
-                rate = gt_total / gt_max if gt_max > 0 else 0
-                print(f"GT Coverage: {gt_total}/{gt_max} outcomes ({rate:.2%}) | Predicates: {self.num_gt}")
-                print(f"  Per-predicate: {gt_pred_cov}")
-                if self.use_tway:
-                    gt_pw = _tway_total(self.pairwise_gt_row) + _tway_total(self.pairwise_gt_agg)
-                    gt_pw_max = (len(self.pairwise_gt_row) + len(self.pairwise_gt_agg)) * (3 ** self.tway_t)
-                    gt_pw_rate = gt_pw / gt_pw_max if gt_pw_max > 0 else 0
-                    print(f"  GT {self.tway_t}-way Coverage: {gt_pw}/{gt_pw_max} pairs ({gt_pw_rate:.2%}) [{len(self.pairwise_gt_row)} row-pairs, {len(self.pairwise_gt_agg)} agg-pairs]")
-                for pred_idx, outcomes in enumerate(self.cumulative_gt):
+        for label, cumulative in (('GT', self.cumulative_gt), ('CD', self.cumulative_cd)):
+            if cumulative:
+                total, maximum = sum(map(len, cumulative)), len(cumulative) * 3
+                print(f"{label} 1-way Coverage: {total}/{maximum} outcomes ({total / maximum:.2%})")
+                for index, outcomes in enumerate(cumulative):
                     missing = {-1, 0, 1} - outcomes
                     if missing:
-                        print(f"  Sig_{pred_idx}: covered {sorted(outcomes)}, missing {sorted(missing)}")
-        if self.num_cd > 0:
-            if self.use_full:
-                cd_row_max = (3 ** self.num_cd_row) if self.num_cd_row > 0 else 0
-                cd_agg_max = (3 ** self.num_cd_agg) if self.num_cd_agg > 0 else 0
-                print(f"CD Full-Combination Coverage: {len(self.full_cd_row)}/{cd_row_max} row-combos, {len(self.full_cd_agg)}/{cd_agg_max} agg-combos")
-            else:
-                cd_pred_cov = [len(s) for s in self.cumulative_cd]
-                cd_total = sum(cd_pred_cov)
-                cd_max = self.num_cd * 3
-                rate = cd_total / cd_max if cd_max > 0 else 0
-                print(f"CD Coverage: {cd_total}/{cd_max} outcomes ({rate:.2%}) | Predicates: {self.num_cd}")
-                print(f"  Per-predicate: {cd_pred_cov}")
-                if self.use_tway:
-                    cd_pw = _tway_total(self.pairwise_cd_row) + _tway_total(self.pairwise_cd_agg)
-                    cd_pw_max = (len(self.pairwise_cd_row) + len(self.pairwise_cd_agg)) * (3 ** self.tway_t)
-                    cd_pw_rate = cd_pw / cd_pw_max if cd_pw_max > 0 else 0
-                    print(f"  CD {self.tway_t}-way Coverage: {cd_pw}/{cd_pw_max} pairs ({cd_pw_rate:.2%}) [{len(self.pairwise_cd_row)} row-pairs, {len(self.pairwise_cd_agg)} agg-pairs]")
-                for pred_idx, outcomes in enumerate(self.cumulative_cd):
-                    missing = {-1, 0, 1} - outcomes
-                    if missing:
-                        print(f"  Sig_{pred_idx}: covered {sorted(outcomes)}, missing {sorted(missing)}")
+                        print(f"  Sig_{index}: covered {sorted(outcomes)}, missing {sorted(missing)}")

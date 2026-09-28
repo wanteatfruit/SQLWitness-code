@@ -4,13 +4,11 @@ from sqlwitness.online.heuristics import HeuristicsHandler
 from sqlwitness.online.generator import DataGenerator
 from sqlwitness.online.runner import DatabaseRunner
 from sqlwitness.online.constraints import ConstraintParser
-from sqlwitness.online.coverage import get_equivalent_queries
 from sqlwitness.coverage import (
     build_boolean_coverage, count_predicates,
-    CoverageAccumulator, TWAY_T,
-    _make_tway_dict, _update_tway, _tway_total,
+    CoverageAccumulator,
 )
-from sqlwitness.estimator import create_terminator, coverage_to_signature, LaplaceTerminator, GoodTuringTerminator
+from sqlwitness.estimator import create_terminator
 import time
 import re
 import random
@@ -468,7 +466,6 @@ def _worker_loop(
     termination_method: Optional[str],
     termination_target_risk: float,
     coverage_available: bool,
-    tway_t: int = 1,
     fallback_max_iters: int = 0,
     remove_null: bool = False,
     remove_one: bool = False,
@@ -483,7 +480,6 @@ def _worker_loop(
     cov_accum = CoverageAccumulator(
         num_gt_row_predicates, num_gt_agg_predicates,
         num_cd_row_predicates, num_cd_agg_predicates,
-        tway_t,
     )
     previous_gt_signal: int = 0
     previous_cd_signal: int = 0
@@ -563,22 +559,11 @@ def _worker_loop(
                     else:
                         cardinality_boost += 2
 
-                    if isinstance(terminator, LaplaceTerminator):
-                        terminator.update(coverage_improved)
-                    elif isinstance(terminator, GoodTuringTerminator):
-                        gt_outcomes = coverage_results.get('gt_outcomes', [])
-                        cd_outcomes = coverage_results.get('cd_outcomes', [])
-                        signature = coverage_to_signature(
-                            cov_accum.cumulative_gt, cov_accum.cumulative_cd,
-                            gt_outcomes, cd_outcomes,
-                            cov_accum.num_gt_row, cov_accum.num_cd_row,
-                            cov_accum.num_gt_agg, cov_accum.num_cd_agg,
-                        )
-                        terminator.update(signature)
+                    terminator.update(coverage_improved)
 
                     if terminator.should_terminate():
                         stats = terminator.get_stats()
-                        label = "full" if cov_accum.use_full else f"{cov_accum.tway_t}-way"
+                        label = "1-way"
                         print(f"  [Worker {worker_id}] Statistical termination ({label}): risk={stats['current_risk']:.4f}")
                         result_queue.put(("done", worker_id, None, i + 1))
                         return
@@ -588,10 +573,7 @@ def _worker_loop(
             elif coverage_saturated and status == "not_found" and coverage_available:
                 cardinality_boost += 2
                 if terminator is not None:
-                    if isinstance(terminator, LaplaceTerminator):
-                        terminator.update(False)
-                    elif isinstance(terminator, GoodTuringTerminator):
-                        terminator.update(False)
+                    terminator.update(False)
                     if terminator.should_terminate():
                         stats = terminator.get_stats()
                         print(f"  [Worker {worker_id}] Statistical termination (saturated): risk={stats['current_risk']:.4f}")
@@ -621,11 +603,10 @@ def counterexample(
     constraints: str,
     groundtruth_query: str,
     candidate_query: str,
-    timeout: Optional[int] = 4,
+    timeout: Optional[int] = 10,
     iteration: Optional[int] = None,
     dialect: str = 'mysql',
     use_multiprocessing: bool = False,
-    sqlfpc_coverage: bool = False,
     boolean_coverage: bool = True,
     termination_method: Optional[str] = 'laplace',
     termination_target_risk: float = 0.05,
@@ -634,6 +615,11 @@ def counterexample(
     remove_one: bool = False,
     remove_literal: bool = False,
 ) -> Tuple[bool, Optional[Dict[str, List[Any]]], float, int]:
+
+    if coverage != 1:
+        raise ValueError("Only 1-way coverage is supported; use coverage=1.")
+    if termination_method not in (None, 'laplace'):
+        raise ValueError("termination_method must be 'laplace' or None.")
 
     if groundtruth_query.strip() == candidate_query.strip():
         return False, None, 0.0, 0
@@ -750,10 +736,9 @@ def counterexample(
             cov_accum = CoverageAccumulator(
                 num_gt_row_predicates, num_gt_agg_predicates,
                 num_cd_row_predicates, num_cd_agg_predicates,
-                coverage,
             )
 
-            cov_label = "full-combination" if coverage == 0 else f"{coverage}-way"
+            cov_label = "1-way"
             print(f"Boolean coverage enabled ({cov_label}):")
             print(f"  GT: {num_gt_row_predicates} row predicates + {num_gt_agg_predicates} agg predicates = {num_gt_predicates} total")
             print(f"  CD: {num_cd_row_predicates} row predicates + {num_cd_agg_predicates} agg predicates = {num_cd_predicates} total")
@@ -801,7 +786,6 @@ def counterexample(
             termination_method=termination_method,
             termination_target_risk=termination_target_risk,
             coverage_available=coverage_available,
-            tway_t=coverage,
             fallback_max_iters=fallback_max_iters,
             remove_null=remove_null,
             remove_one=remove_one,
@@ -978,22 +962,11 @@ def counterexample(
                         else:
                             iterations_without_improvement += 1
                             cardinality_boost += 2
-                            signal_label = "full" if (cov_accum and cov_accum.use_full) else (f"{cov_accum.tway_t}-way" if (cov_accum and cov_accum.use_tway) else "1-way")
+                            signal_label = "1-way"
                             print(f"  📈 {signal_label} coverage stalled, boosting cardinality (now +{cardinality_boost})")
 
                         if terminator is not None:
-                            if isinstance(terminator, LaplaceTerminator):
-                                terminator.update(coverage_improved)
-                            elif isinstance(terminator, GoodTuringTerminator) and cov_accum is not None:
-                                gt_outcomes = coverage_results.get('gt_outcomes', [])
-                                cd_outcomes = coverage_results.get('cd_outcomes', [])
-                                signature = coverage_to_signature(
-                                    cov_accum.cumulative_gt, cov_accum.cumulative_cd,
-                                    gt_outcomes, cd_outcomes,
-                                    cov_accum.num_gt_row, cov_accum.num_cd_row,
-                                    cov_accum.num_gt_agg, cov_accum.num_cd_agg,
-                                )
-                                terminator.update(signature)
+                            terminator.update(coverage_improved)
 
                             stats = terminator.get_stats()
                             print(f"  Terminator: risk={stats['current_risk']:.4f} (target={stats['target_risk']})")
@@ -1005,8 +978,6 @@ def counterexample(
                             print(f"   Total iterations: {stats['total_iterations']}")
                             if 'consecutive_boring' in stats:
                                 print(f"   Consecutive boring: {stats['consecutive_boring']}/{stats['patience_limit']}")
-                            if 'singletons_n1' in stats:
-                                print(f"   Singletons: {stats['singletons_n1']}, Unique signatures: {stats['unique_signatures']}")
                             total_time = time.time() - start_time
                             return False, None, total_time, seq_iters
 
@@ -1019,10 +990,7 @@ def counterexample(
                     iterations_without_improvement += 1
                     cardinality_boost += 2
                     if terminator is not None:
-                        if isinstance(terminator, LaplaceTerminator):
-                            terminator.update(False)
-                        elif isinstance(terminator, GoodTuringTerminator):
-                            terminator.update(False)
+                        terminator.update(False)
                         stats = terminator.get_stats()
                         print(f"  Terminator (saturated): risk={stats['current_risk']:.4f} (target={stats['target_risk']})")
                         if terminator.should_terminate():
@@ -1092,7 +1060,7 @@ def counterexample_multidialect(
     constraints: str,
     groundtruth_query: str,
     candidate_query: str,
-    timeout: Optional[int] = 4,
+    timeout: Optional[int] = 10,
     iteration: Optional[int] = None,
     dialect_gt: str = 'mysql',
     dialect_cd: str = 'postgresql',
@@ -1104,6 +1072,11 @@ def counterexample_multidialect(
     remove_one: bool = False,
     remove_literal: bool = False,
 ) -> Tuple[bool, Optional[Dict[str, List[Any]]], float, int]:
+
+    if coverage != 1:
+        raise ValueError("Only 1-way coverage is supported; use coverage=1.")
+    if termination_method not in (None, 'laplace'):
+        raise ValueError("termination_method must be 'laplace' or None.")
 
     if groundtruth_query.strip() == candidate_query.strip():
         return False, None, 0.0, 0
@@ -1221,10 +1194,9 @@ def counterexample_multidialect(
             cov_accum = CoverageAccumulator(
                 num_gt_row_predicates, num_gt_agg_predicates,
                 num_cd_row_predicates, num_cd_agg_predicates,
-                coverage,
             )
 
-            cov_label = "full-combination" if coverage == 0 else f"{coverage}-way"
+            cov_label = "1-way"
             print(f"Boolean coverage enabled ({cov_label}):")
             print(f"  GT: {num_gt_row_predicates} row predicates + {num_gt_agg_predicates} agg predicates = {num_gt_predicates} total")
             print(f"  CD: {num_cd_row_predicates} row predicates + {num_cd_agg_predicates} agg predicates = {num_cd_predicates} total")
@@ -1394,22 +1366,11 @@ def counterexample_multidialect(
                     else:
                         iterations_without_improvement += 1
                         cardinality_boost += 2
-                        signal_label = "full" if (cov_accum and cov_accum.use_full) else (f"{cov_accum.tway_t}-way" if (cov_accum and cov_accum.use_tway) else "1-way")
+                        signal_label = "1-way"
                         print(f"  📈 {signal_label} coverage stalled, boosting cardinality (now +{cardinality_boost})")
 
                     if terminator is not None:
-                        if isinstance(terminator, LaplaceTerminator):
-                            terminator.update(coverage_improved)
-                        elif isinstance(terminator, GoodTuringTerminator) and cov_accum is not None:
-                            gt_outcomes = coverage_results.get('gt_outcomes', [])
-                            cd_outcomes = coverage_results.get('cd_outcomes', [])
-                            signature = coverage_to_signature(
-                                cov_accum.cumulative_gt, cov_accum.cumulative_cd,
-                                gt_outcomes, cd_outcomes,
-                                cov_accum.num_gt_row, cov_accum.num_cd_row,
-                                cov_accum.num_gt_agg, cov_accum.num_cd_agg,
-                            )
-                            terminator.update(signature)
+                        terminator.update(coverage_improved)
 
                         stats = terminator.get_stats()
                         print(f"  Terminator: risk={stats['current_risk']:.4f} (target={stats['target_risk']})")
@@ -1421,8 +1382,6 @@ def counterexample_multidialect(
                         print(f"   Total iterations: {stats['total_iterations']}")
                         if 'consecutive_boring' in stats:
                             print(f"   Consecutive boring: {stats['consecutive_boring']}/{stats['patience_limit']}")
-                        if 'singletons_n1' in stats:
-                            print(f"   Singletons: {stats['singletons_n1']}, Unique signatures: {stats['unique_signatures']}")
                         total_time = time.time() - start_time
                         return False, None, total_time, seq_iters
 
@@ -1435,10 +1394,7 @@ def counterexample_multidialect(
                 iterations_without_improvement += 1
                 cardinality_boost += 2
                 if terminator is not None:
-                    if isinstance(terminator, LaplaceTerminator):
-                        terminator.update(False)
-                    elif isinstance(terminator, GoodTuringTerminator):
-                        terminator.update(False)
+                    terminator.update(False)
                     stats = terminator.get_stats()
                     print(f"  Terminator (saturated): risk={stats['current_risk']:.4f} (target={stats['target_risk']})")
                     if terminator.should_terminate():
